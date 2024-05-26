@@ -50,12 +50,34 @@ def get_staged_changes_diffs(filename: str) -> Optional[str]:
 
 
 @tool
-def get_codebase_context(diffs: str) -> List[str]:
+def get_changed_diffs(filename: str) -> Optional[str]:
     """
-    Takes in a given current file's diff and returns similar documents from a vector database
+    Fetches the current diff for a file or returns None for error
 
     Parameters:
-    current_file_diffs (str): The current file's diffs to embed and perform a vector database search for
+    filename (str): The filename to fetch git diffs for
+
+    Returns:
+    (Optional[str]): The list of diffs for a given file or None if they cannot be fetched
+    """
+    try:
+        result = subprocess.run(["git", "diff"], capture_output=True, text=True)
+
+        if result.returncode == 0:
+            return result.stdout
+        else:
+            return None
+    except Exception as e:
+        return None
+
+
+@tool
+def get_codebase_context(search: str) -> List[str]:
+    """
+    Takes in a search returns similar documents from a vector database
+
+    Parameters:
+    search (str): A search to embed and perform a vector database search for
 
     Returns:
     (List[str]): The list of similar document founds in the vector database
@@ -67,7 +89,7 @@ def get_codebase_context(diffs: str) -> List[str]:
 
     retriever = document_vectorstore.as_retriever()
 
-    return retriever.invoke(diffs)
+    return retriever.invoke(search)
 
 
 # First, embed entire codebase
@@ -77,6 +99,7 @@ tools = [
     ShellTool(ask_human_input=True),
     get_staged_changes_diffs,
     get_codebase_context,
+    get_changed_diffs,
 ]
 
 # Create LLM with tools to perform code review
@@ -87,7 +110,14 @@ prompt = ChatPromptTemplate.from_messages(
     [
         (
             "system",
-            "You are an expert web developer skilled in code reviewing. When the user asks a question, fetch current diffs or use codebase context if needed. Use that as overall context for the user's question. Keep your answers short with no yapping. Do not ask which files you should check, but parse through the diffs and codebase context to suggest that yourself. Format your response for a terminal with multiple line breaks before and after.",
+            """
+            You are an expert web developer skilled in code reviewing. When the user asks a question:
+
+            1. First, fetch the current diffs.
+            2. If the information is not found in the diffs, use the codebase context.
+
+            Keep your answers very short with no yapping. Do not ask which files to check; parse through the diffs and codebase context to determine that yourself. Format your response for a terminal with multiple line breaks before and after.
+            """,
         ),
         ("user", "{input}"),
         MessagesPlaceholder(variable_name="agent_scratchpad"),
