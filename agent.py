@@ -1,173 +1,103 @@
-import os
-from langchain_openai import ChatOpenAI
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain.agents import AgentExecutor
 from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain.tools import tool
-from langsmith import traceable
-from langchain_community.tools.shell.tool import ShellTool
 from langchain.agents.format_scratchpad.openai_tools import (
     format_to_openai_tool_messages,
 )
+from langchain_community.tools.shell.tool import ShellTool
+from langchain_pinecone import PineconeVectorStore
+from pinecone import Pinecone, ServerlessSpec
 from langchain.agents.output_parsers.openai_tools import OpenAIToolsAgentOutputParser
+from langchain_community.document_loaders import DirectoryLoader
+from typing import Dict, List, Optional
+from dotenv import load_dotenv
+from utils import *
 import subprocess
-from typing import Optional
+import json
+import os
 
-ROOT_DIR = "./"
-VALID_FILE_TYPES = {
-    "py",
-    "txt",
-    "md",
-    "cpp",
-    "c",
-    "java",
-    "js",
-    "html",
-    "css",
-    "ts",
-    "json",
-}
+
+load_dotenv()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
+
+INDEX_NAME = "code-review-bot"
 
 
 @tool
-def create_react_app_with_vite():
+def get_staged_changes_diffs(filename: str) -> Optional[str]:
     """
-    This function creates a new React application using Vite in the 'app' directory located in the root.
-
-    It navigates to the root directory, finds or creates the 'app' directory,
-    and uses the npm 'create vite@latest' command to scaffold a new React project
-    with Vite as the build tool and React as the template. If the process is
-    successful, it prints a success message. If any subprocess command fails,
-    it catches the CalledProcessError exception and prints an error message.
-    """
-    try:
-        # Create a new Vite project in the app directory with React template
-        subprocess.run(
-            ["npm", "create", "vite@latest", ".", "--template", "react"], check=True
-        )
-        # Print success message if project creation is successful
-        return f"Successfully created a new React app using Vite."
-    except subprocess.CalledProcessError as e:
-        # Print error message if any subprocess command fails
-        return f"An error occurred: {e}"
-    except Exception as e:
-        # Print error message if any other exception occurs
-        return f"An unexpected error occurred: {e}"
-
-
-@tool
-def create_directory(directory: str) -> str:
-    """
-    Create a new writable directory with the given directory name if it does not exist.
-    If the directory exists, it ensures the directory is writable.
+    Fetches the current diff for a file or returns None for error
 
     Parameters:
-    directory (str): The name of the directory to create.
+    filename (str): The filename to fetch git diffs for
 
     Returns:
-    str: Success or error message.
+    (Optional[str]): The list of diffs for a given file or None if they cannot be fetched
     """
-    if ".." in directory:
-        return f"Cannot make a directory with '..' in path"
     try:
-        os.makedirs(directory, exist_ok=True)
-        subprocess.run(["chmod", "u+w", directory], check=True)
-        return f"Directory successfully '{directory}' created and set as writeable."
-    except subprocess.CalledProcessError as e:
-        return f"Failed to create or set writable directory '{directory}': {e}"
+        result = subprocess.run(
+            ["git", "diff", "--staged"], capture_output=True, text=True
+        )
+
+        if result.returncode == 0:
+            return result.stdout
+        else:
+            return None
     except Exception as e:
-        return f"An unexpected error occurred: {e}"
+        return None
 
 
 @tool
-def find_file(filename: str, path: str) -> Optional[str]:
+def get_codebase_context(diffs: str) -> List[str]:
     """
-    Recursively searches for a file in the given path.
-    Returns string of full path to file, or None if file not found.
+    Takes in a given current file's diff and returns similar documents from a vector database
+
+    Parameters:
+    current_file_diffs (str): The current file's diffs to embed and perform a vector database search for
+
+    Returns:
+    (List[str]): The list of similar document founds in the vector database
     """
-    # TODO handle multiple matches
-    for root, dirs, files in os.walk(path):
-        if filename in files:
-            return os.path.join(root, filename)
-    return None
+    embeddings = OpenAIEmbeddings(model="text-embedding-3-large")
+    document_vectorstore = PineconeVectorStore(
+        index_name=INDEX_NAME, embedding=embeddings
+    )
+
+    retriever = document_vectorstore.as_retriever()
+
+    return retriever.invoke(diffs)
 
 
-@tool
-def create_file(filename: str, content: str = "", directory=""):
-    """Creates a new file and content in the specified directory."""
-    # Validate file type
-    try:
-        file_stem, file_type = filename.split(".")
-        assert file_type in VALID_FILE_TYPES
-    except:
-        return f"Invalid filename {filename} - must end with a valid file type: {valid_file_types}"
-    directory_path = os.path.join(ROOT_DIR, directory)
-    file_path = os.path.join(directory_path, filename)
-    if not os.path.exists(file_path):
-        try:
-            with open(file_path, "w") as file:
-                file.write(content)
-            print(f"File '{filename}' created successfully at: '{file_path}'.")
-            return f"File '{filename}' created successfully at: '{file_path}'."
-        except Exception as e:
-            print(f"Failed to create file '{filename}' at: '{file_path}': {str(e)}")
-            return f"Failed to create file '{filename}' at: '{file_path}': {str(e)}"
-    else:
-        print(f"File '{filename}' already exists at: '{file_path}'.")
-        return f"File '{filename}' already exists at: '{file_path}'."
+# First, embed entire codebase
+embed_documents(INDEX_NAME)
 
-
-@tool
-def update_file(filename: str, content: str, directory: str = ""):
-    """Updates, appends, or modifies an existing file with new content."""
-    if directory:
-        file_path = os.path.join(ROOT_DIR, directory, filename)
-    else:
-        file_path = find_file(filename, ROOT_DIR)
-
-    if file_path and os.path.exists(file_path):
-        try:
-            with open(file_path, "a") as file:
-                file.write(content)
-            return f"File '{filename}' updated successfully at: '{file_path}'"
-        except Exception as e:
-            return f"Failed to update file '{filename}' at: '{file_path}' - {str(e)}"
-    else:
-        return f"File '{filename}' not found at: '{file_path}'"
-
-
-# List of tools to use
 tools = [
     ShellTool(ask_human_input=True),
-    create_directory,
-    create_react_app_with_vite,
-    find_file,
-    create_file,
-    update_file,
-    # Add more tools if needed
+    get_staged_changes_diffs,
+    get_codebase_context,
 ]
 
-
-# Configure the language model
+# Create LLM with tools to perform code review
 llm = ChatOpenAI(model="gpt-4o", temperature=0)
-
 
 # Set up the prompt template
 prompt = ChatPromptTemplate.from_messages(
     [
         (
             "system",
-            "You are an expert web developer.",
+            "You are an expert web developer skilled in code reviewing. When the user asks a question, fetch current diffs or use codebase context if needed. Use that as overall context for the user's question. Keep your answers short with no yapping. Do not ask which files you should check, but parse through the diffs and codebase context to suggest that yourself. Format your response for a terminal with multiple line breaks before and after.",
         ),
         ("user", "{input}"),
         MessagesPlaceholder(variable_name="agent_scratchpad"),
     ]
 )
 
-
 # Bind the tools to the language model
 llm_with_tools = llm.bind_tools(tools)
 
-
+# Create the agent
 agent = (
     {
         "input": lambda x: x["input"],
@@ -180,9 +110,8 @@ agent = (
     | OpenAIToolsAgentOutputParser()
 )
 
-
+# Create the agent executor
 agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
-
 
 # Main loop to prompt the user
 while True:
